@@ -188,6 +188,8 @@ impl<'a> From<Pair<'a, Rule>> for EnumTy {
       match pair.as_rule() {
         Rule::ident => ident = Some(pair.as_str().into()),
         Rule::enum_case => cases.push(pair.into()),
+        // TODO use this
+        Rule::comment => {}
         _ => unreachable!(),
       }
     }
@@ -351,9 +353,9 @@ pub trait WriteTo {
 impl WriteTo for AVDLRecordProp {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
     for attr in self.attributes.iter() {
-      write!(w, "// {}\n", attr)?;
+      write!(w, "  // {}\n", attr)?;
     }
-    write!(w, "{}: {},\n", self.field, self.ty)?;
+    write!(w, "  {}: {},\n", self.field, self.ty)?;
     Ok(())
   }
 }
@@ -394,7 +396,7 @@ where
   while let Some(pair) = parts.next() {
     match pair.as_rule() {
       Rule::ty => type_name = Some(pair.into()),
-      Rule::comment => write!(w, "// {}", pair.as_str())?,
+      Rule::comment => write!(w, "{}", pair.as_str())?,
       Rule::record_prop => {
         record_props.push(pair.into());
       }
@@ -425,14 +427,11 @@ where
     .into_inner()
     .enumerate()
   {
-    if i > 3 {
-      return Ok(());
-    }
     match node.as_rule() {
       Rule::namespace_annotation => {
         if let Some(n) = node.into_inner().next() {
           match n.as_rule() {
-            Rule::namespace_name => write!(w, "Namespace: {:?}", n.as_str())?,
+            Rule::namespace_name => write!(w, "// Namespace: {:?}\n", n.as_str())?,
             _ => unreachable!(),
           }
         }
@@ -441,7 +440,7 @@ where
         let mut inner = node.into_inner();
         while let Some(n) = inner.next() {
           match n.as_rule() {
-            Rule::protocol_name => write!(w, "Protocol: {:?}\n", n.as_str())?,
+            Rule::protocol_name => write!(w, "// Protocol: {:?}\n", n.as_str())?,
             Rule::protocol_body => {
               let mut inner = n.into_inner();
               while let Some(protocol_body_node) = inner.next() {
@@ -456,6 +455,8 @@ where
                   Rule::fixed_ty => convert_fixed(w, protocol_body_node)?,
                   _ => {}
                 }
+
+                write!(w, "{}", "\n\n");
               }
             }
             _ => unreachable!(),
@@ -553,8 +554,8 @@ mod tests {
   InboxVers vers;
 }"#,
       r#"struct InboxVersInfo {
-uid: gregor1::UID,
-vers: InboxVers,
+  uid: gregor1::UID,
+  vers: InboxVers,
 }"#,
     )
     .unwrap();
@@ -569,12 +570,12 @@ vers: InboxVers,
     InboxVers vers;
 }"#,
       r#"struct InboxVersInfo {
-// @mpackkey("b")
-// @jsonkey("b")
-botUID: Option<gregor1::UID>,
-// @mpackkey("c")
-// @jsonkey("c")
-vers: InboxVers,
+  // @mpackkey("b")
+  // @jsonkey("b")
+  botUID: Option<gregor1::UID>,
+  // @mpackkey("c")
+  // @jsonkey("c")
+  vers: InboxVers,
 }"#,
     )
     .unwrap();
