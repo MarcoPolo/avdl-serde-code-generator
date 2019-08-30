@@ -1,29 +1,28 @@
 #![allow(dead_code)]
-use crate::{AVDLParser, Rule};
-use pest::{
-  iterators::{Pair, Pairs},
-  Parser,
-};
+use crate::Rule;
+use pest::iterators::{Pair, Pairs};
 use std::{
   error::Error,
-  fs,
+  fmt::Write as FmtWrite,
   io::{self, Write},
   str::FromStr,
 };
 
 fn convert_path_str_to_rust_mod(path: &str, as_name: &str) -> String {
   let path = String::from(path);
-  let parts: Vec<&str> = path.split("/").skip_while(|s| s != &"protocol").collect();
+  let has_parts = path.contains("/");
+  let parts: Vec<&str> = path.split("/").collect();
+  let is_as_name_same = as_name == "" || parts.last().unwrap() == &as_name;
 
-  let is_as_name_same = parts.last().unwrap() == &as_name;
-
-  let mut module = parts
-    .into_iter()
-    .fold(String::from("crate"), |mut s, part| {
-      s.push_str("::");
-      s.push_str(part);
-      s
-    });
+  let mut module = if has_parts {
+    let important_parts = parts
+      .into_iter()
+      .skip_while(|s| s != &"protocol")
+      .collect::<Vec<&str>>();
+    format!("crate::{}", important_parts.join("::"))
+  } else {
+    format!("{}", path.replace(".avdl", ""))
+  };
 
   if !is_as_name_same {
     module.push_str(" as ");
@@ -40,13 +39,13 @@ where
 {
   assert_eq!(p.as_rule(), Rule::import);
   let parts = p.into_inner().take(3).collect::<Vec<Pair<Rule>>>();
-  let (kind, path, as_name) = (&parts[0], &parts[1], &parts[2]);
+  let (kind, path, as_name) = (&parts[0], &parts[1], parts.get(2));
   match kind.as_str() {
     "idl" => {
       write!(
         w,
         "use {}",
-        convert_path_str_to_rust_mod(path.as_str(), as_name.as_str())
+        convert_path_str_to_rust_mod(path.as_str(), as_name.map(|p| p.as_str()).unwrap_or(""))
       )?;
     }
     _ => panic!("Unhandled import kind (not idl)"),
@@ -60,6 +59,10 @@ fn convert_idl_type_to_rust_type(idl_type: &str) -> String {
     "bytes" => String::from("[u8]"),
     "uint64" => String::from("u64"),
     "uint32" => String::from("u32"),
+    "array" => String::from("Vec"),
+    "string" => String::from("String"),
+    "void" => String::from("()"),
+    "map" => String::from("HashMap"),
     _ => idl_type.into(),
   }
 }
@@ -84,6 +87,54 @@ impl ToString for AVDLType {
   }
 }
 
+struct AVDLSimpleType {
+  ty: Option<String>,
+  generics: Vec<AVDLType>,
+}
+
+impl ToString for AVDLSimpleType {
+  fn to_string(&self) -> String {
+    let mut s = self.ty.as_ref().unwrap().clone();
+    if !self.generics.is_empty() {
+      write!(
+        &mut s,
+        "<{}>",
+        self
+          .generics
+          .iter()
+          .map(|g| g.to_string())
+          .collect::<Vec<String>>()
+          .join(", ")
+      )
+      .unwrap();
+    }
+    s
+  }
+}
+
+impl<'a> From<Pair<'a, Rule>> for AVDLSimpleType {
+  fn from(pair: Pair<'a, Rule>) -> Self {
+    assert_eq!(pair.as_rule(), Rule::simple_ty);
+    let parts = pair.into_inner();
+    let mut ty = AVDLSimpleType {
+      ty: None,
+      generics: vec![],
+    };
+
+    let transform = |p: &Pair<Rule>| convert_dot_to_sep(&convert_idl_type_to_rust_type(p.as_str()));
+
+    for pair in parts {
+      match pair.as_rule() {
+        Rule::ns_ident => ty.ty = Some(transform(&pair)),
+        Rule::ty => ty.generics.push(pair.into()),
+        _ => unreachable!(),
+      }
+    }
+
+    ty
+  }
+}
+
 impl<'a> From<Pair<'a, Rule>> for AVDLType {
   fn from(pair: Pair<'a, Rule>) -> Self {
     assert!(
@@ -94,9 +145,10 @@ impl<'a> From<Pair<'a, Rule>> for AVDLType {
 
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-      Rule::simple_ty => AVDLType::Simple(convert_dot_to_sep(&convert_idl_type_to_rust_type(
-        inner.as_str(),
-      ))),
+      Rule::simple_ty => {
+        let ty: AVDLSimpleType = inner.into();
+        AVDLType::Simple(ty.to_string())
+      }
       Rule::maybe_ty => {
         let inner_ty: AVDLType = inner.into();
         AVDLType::Maybe(inner_ty.to_string())
@@ -136,6 +188,7 @@ where
 struct EnumCaseTy {
   enum_name: String,
   comment: Option<String>,
+  preline_comment: Option<String>,
 }
 
 impl<'a> From<Pair<'a, Rule>> for EnumCaseTy {
@@ -158,12 +211,16 @@ impl<'a> From<Pair<'a, Rule>> for EnumCaseTy {
     EnumCaseTy {
       enum_name: enum_name.unwrap(),
       comment,
+      preline_comment: None,
     }
   }
 }
 
 impl WriteTo for EnumCaseTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
+    if let Some(preline_comment) = self.preline_comment.as_ref() {
+      write!(w, "  {}", preline_comment)?;
+    }
     write!(
       w,
       "  {},{}",
@@ -183,13 +240,17 @@ impl<'a> From<Pair<'a, Rule>> for EnumTy {
   fn from(pair: Pair<'a, Rule>) -> Self {
     let mut parts = pair.into_inner();
     let mut ident: Option<String> = None;
+    let mut comment: Option<String> = None;
     let mut cases: Vec<EnumCaseTy> = vec![];
     while let Some(pair) = parts.next() {
       match pair.as_rule() {
         Rule::ident => ident = Some(pair.as_str().into()),
-        Rule::enum_case => cases.push(pair.into()),
-        // TODO use this
-        Rule::comment => {}
+        Rule::enum_case => {
+          let mut case: EnumCaseTy = pair.into();
+          case.preline_comment = comment.take();
+          cases.push(case);
+        }
+        Rule::comment => comment = Some(pair.as_str().into()),
         _ => unreachable!(),
       }
     }
@@ -219,7 +280,7 @@ where
   assert_eq!(p.as_rule(), Rule::enum_ty);
   // This is actually already a rust enum!
   let ty: EnumTy = p.into();
-  ty.write_to(w);
+  ty.write_to(w)?;
 
   // write!(w, "{}", p.as_str())?;
   Ok(())
@@ -242,6 +303,7 @@ fn quiet_voice(s: &str) -> String {
 struct VariantCaseTy {
   enum_name: String,
   enum_inner_ty: String,
+  comment: Option<String>,
 }
 
 impl<'a> From<Pair<'a, Rule>> for VariantCaseTy {
@@ -249,10 +311,12 @@ impl<'a> From<Pair<'a, Rule>> for VariantCaseTy {
     let mut parts = pair.into_inner();
     let mut enum_name: Option<String> = None;
     let mut enum_inner_ty: Option<AVDLType> = None;
+    let mut comment: Option<String> = None;
     while let Some(pair) = parts.next() {
       match pair.as_rule() {
         Rule::ident => enum_name = Some(quiet_voice(pair.as_str())),
         Rule::ty => enum_inner_ty = Some(pair.into()),
+        Rule::comment => comment = Some(format!(" {}", pair.as_str())),
         _ => unreachable!(),
       }
     }
@@ -260,6 +324,7 @@ impl<'a> From<Pair<'a, Rule>> for VariantCaseTy {
     VariantCaseTy {
       enum_name: enum_name.unwrap(),
       enum_inner_ty: enum_inner_ty.unwrap().to_string(),
+      comment,
     }
   }
 }
@@ -341,7 +406,7 @@ where
 }
 
 struct AVDLRecordProp {
-  ty: String,
+  ty: AVDLType,
   field: String,
   attributes: Vec<String>,
 }
@@ -355,7 +420,7 @@ impl WriteTo for AVDLRecordProp {
     for attr in self.attributes.iter() {
       write!(w, "  // {}\n", attr)?;
     }
-    write!(w, "  {}: {},\n", self.field, self.ty)?;
+    write!(w, "  {}: {},\n", self.field, self.ty.to_string())?;
     Ok(())
   }
 }
@@ -377,7 +442,7 @@ impl<'a> From<Pair<'a, Rule>> for AVDLRecordProp {
     }
 
     AVDLRecordProp {
-      ty: ty.expect("Couldn't find types").to_string(),
+      ty: ty.expect("Couldn't find types"),
       field: field.expect("Couldn't find field"),
       attributes,
     }
@@ -417,16 +482,19 @@ where
   Ok(())
 }
 
+fn convert_interface_fn<W>(_w: &mut W, _p: Pair<Rule>) -> Result<(), Box<dyn Error>>
+where
+  W: Write,
+{
+  // Not implemented. Skipping for now
+  Ok(())
+}
+
 pub fn build_rust_code_from_avdl<W>(mut input: Pairs<Rule>, w: &mut W) -> Result<(), Box<dyn Error>>
 where
   W: Write,
 {
-  for (i, node) in input
-    .next()
-    .expect("Nothing to parse")
-    .into_inner()
-    .enumerate()
-  {
+  for node in input.next().expect("Nothing to parse").into_inner() {
     match node.as_rule() {
       Rule::namespace_annotation => {
         if let Some(n) = node.into_inner().next() {
@@ -444,6 +512,12 @@ where
             Rule::protocol_body => {
               let mut inner = n.into_inner();
               while let Some(protocol_body_node) = inner.next() {
+                let separator = match protocol_body_node.as_rule() {
+                  Rule::comment => "",
+                  Rule::generic_annotation => "\n",
+                  _ => "\n\n",
+                };
+
                 match protocol_body_node.as_rule() {
                   Rule::comment => write!(w, "{}", protocol_body_node.as_str())?,
                   Rule::import => convert_to_import(w, protocol_body_node)?,
@@ -453,10 +527,11 @@ where
                   Rule::enum_ty => convert_enum(w, protocol_body_node)?,
                   Rule::variant_ty => convert_variant(w, protocol_body_node)?,
                   Rule::fixed_ty => convert_fixed(w, protocol_body_node)?,
+                  Rule::interface_fn => convert_interface_fn(w, protocol_body_node)?,
                   _ => {}
                 }
 
-                write!(w, "{}", "\n\n");
+                write!(w, "{}", separator)?;
               }
             }
             _ => unreachable!(),
@@ -464,9 +539,9 @@ where
           write!(w, "\n")?;
         }
       }
+      Rule::generic_annotation => {}
       _ => unreachable!(),
     }
-    println!("-----------------");
   }
   Ok(())
 }
@@ -474,6 +549,8 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::AVDLParser;
+  use pest::Parser;
 
   fn test_conversion<F>(
     r: Rule,
@@ -491,7 +568,22 @@ mod tests {
   }
 
   #[test]
+  fn test_type_conversion() {
+    let input = AVDLParser::parse(Rule::ty, "map<TeamInviteID,AnnotatedTeamInvite>");
+    println!("{:?}", input);
+    let ty: AVDLType = input.unwrap().next().unwrap().into();
+    assert_eq!(ty.to_string(), "HashMap<TeamInviteID, AnnotatedTeamInvite>")
+  }
+
+  #[test]
   fn test_convert_import() -> Result<(), Box<dyn Error>> {
+    test_conversion(
+      Rule::import,
+      convert_to_import,
+      r#"import idl "chat_ui.avdl";"#,
+      "use chat_ui;",
+    )
+    .unwrap();
     test_conversion(
       Rule::import,
       convert_to_import,
@@ -508,6 +600,72 @@ mod tests {
     .unwrap();
 
     Ok(())
+  }
+
+  #[test]
+  fn test_interface_fn() {
+    // test_conversion(
+    //   Rule::typedef,
+    //   convert_typedef,
+    //   r#"GetInboxAndUnboxLocalRes getInboxAndUnboxLocal(union { null, GetInboxLocalQuery} query, union { null, Pagination } pagination, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
+    //   r#"fn getInboxAndUnboxLocal(&self, query: Option<GetInboxLocalQuery> query, pagination: Option<Pagination>, identifyBehavior: keybase1.TLFIdentifyBehavior) -> GetInboxAndUnboxLocalRes;"#,
+    // )
+    // .unwrap();
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"GetInboxAndUnboxLocalRes getInboxAndUnboxLocal(union { null, GetInboxLocalQuery} query, union { null, Pagination } pagination, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
+      r#""#,
+    )
+    .unwrap();
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"  UnreadlineRes getUnreadline(int sessionID, ConversationID convID,
+MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
+      r#""#,
+    )
+    .unwrap();
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"    OutboxID generateOutboxID();"#,
+      r#""#,
+    )
+    .unwrap();
+
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"  void start(int sessionID, string username, IdentifyReason reason, boolean forceDisplay=false);"#,
+      r#""#,
+    )
+    .unwrap();
+
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"  PostRemoteRes postRemote(
+    ConversationID conversationID,
+    MessageBoxed messageBoxed,
+    array<gregor1.UID> atMentions,
+    ChannelMention channelMention,
+    union { null, TopicNameState } topicNameState,
+    // Add any atMentions to the conversation automatically with the given
+    // status
+    union { null, ConversationMemberStatus } joinMentionsAs
+  );"#,
+      r#""#,
+    )
+    .unwrap();
+
+    test_conversion(
+      Rule::interface_fn,
+      convert_interface_fn,
+      r#"  void chatAttachmentDownloadProgress(int sessionID, long bytesComplete, long bytesTotal) oneway;"#,
+      r#""#,
+    )
+    .unwrap();
   }
 
   #[test]
@@ -579,6 +737,22 @@ mod tests {
 }"#,
     )
     .unwrap();
+
+    test_conversion(
+      Rule::record,
+      convert_record,
+      r#"record ConvSummary {
+  @jsonkey("supersedes")
+  @optional(true)
+  array<string> supersedes;
+}"#,
+      "struct ConvSummary {
+  // @jsonkey(\"supersedes\")
+  // @optional(true)
+  supersedes: Vec<String>,
+}",
+    )
+    .unwrap();
   }
 
   #[test]
@@ -606,6 +780,19 @@ mod tests {
   Image(AssetMetadataImage),
   Video(AssetMetadataVideo),
   Audio(AssetMetadataAudio),
+}",
+    )
+    .unwrap();
+    test_conversion(
+      Rule::variant_ty,
+      convert_variant,
+      r#"variant AssetMetadata switch (AssetMetadataType assetType) {
+    case IMAGE: AssetMetadataImage;
+    default: void; // Note, if badged, we should urge an upgrade here.
+}"#,
+      "enum AssetMetadata {
+  Image(AssetMetadataImage),
+  Default(()),
 }",
     )
     .unwrap();
