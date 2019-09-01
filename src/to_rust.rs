@@ -21,7 +21,7 @@ fn convert_path_str_to_rust_mod(path: &str, as_name: &str) -> String {
       .collect::<Vec<&str>>();
     format!("crate::{}", important_parts.join("::"))
   } else {
-    format!("{}", path.replace(".avdl", ""))
+    format!("super::{}::*", path.replace(".avdl", ""))
   };
 
   if !is_as_name_same {
@@ -54,15 +54,33 @@ where
   Ok(())
 }
 
-fn convert_idl_type_to_rust_type(idl_type: &str) -> String {
+// Hack to handle cases where the struct is actually infinite size.
+// We make the type a Box<T> when it's used.
+fn should_box(idl_type: &str) -> bool {
   match idl_type {
-    "bytes" => String::from("[u8]"),
+    "MessageUnboxed" | "UIMessage" => true,
+    _ => false,
+  }
+}
+
+fn convert_idl_type_to_rust_type(idl_type: &str) -> String {
+  if should_box(idl_type) {
+    return format!("Box<{}>", idl_type);
+  }
+  match idl_type {
+    "bytes" => String::from("Vec<u8>"),
+    "boolean" => String::from("bool"),
+    "uint" => String::from("u32"),
+    "int" => String::from("i32"),
+    "int64" => String::from("i64"),
+    "long" => String::from("i64"),
+    "double" => String::from("f64"),
     "uint64" => String::from("u64"),
     "uint32" => String::from("u32"),
     "array" => String::from("Vec"),
     "string" => String::from("String"),
     "void" => String::from("()"),
-    "map" => String::from("HashMap"),
+    "map" => String::from("std::collections::HashMap"),
     _ => idl_type.into(),
   }
 }
@@ -131,6 +149,13 @@ impl<'a> From<Pair<'a, Rule>> for AVDLSimpleType {
       }
     }
 
+    if ty.ty.as_ref().map(|s| s.as_str()) == Some("std::collections::HashMap")
+      && ty.generics.len() == 1
+    {
+      ty.generics
+        .insert(0, AVDLType::Simple(String::from("String")));
+    }
+
     ty
   }
 }
@@ -158,6 +183,23 @@ impl<'a> From<Pair<'a, Rule>> for AVDLType {
   }
 }
 
+struct AVDLIdent(String);
+impl<'a> From<Pair<'a, Rule>> for AVDLIdent {
+  fn from(pair: Pair<'a, Rule>) -> Self {
+    assert_eq!(pair.as_rule(), Rule::ident);
+    let s = match pair.as_str() {
+      "box" => "box_",
+      "match" => "match_",
+      "ref" => "ref_",
+      "type" => "ty",
+      "self" => "self_",
+      "where" => "where_",
+      _ => pair.as_str(),
+    };
+    AVDLIdent(s.into())
+  }
+}
+
 fn convert_typedef<W>(w: &mut W, p: Pair<Rule>) -> Result<(), Box<dyn Error>>
 where
   W: Write,
@@ -173,14 +215,19 @@ where
         type_target = Some(ty.to_string());
       }
       Rule::lint => {
-        write!(w, "// LINT: {}", pair.as_str())?;
+        write!(w, "// LINT: {}\n", pair.as_str())?;
       }
       Rule::record => type_name = Some(pair.into_inner().next().unwrap().as_str().into()),
       _ => unreachable!(),
     }
   }
 
-  write!(w, "type {} = {};", type_name.unwrap(), type_target.unwrap())?;
+  write!(
+    w,
+    "pub type {} = {};",
+    type_name.unwrap(),
+    type_target.unwrap()
+  )?;
 
   Ok(())
 }
@@ -198,11 +245,7 @@ impl<'a> From<Pair<'a, Rule>> for EnumCaseTy {
     let mut comment: Option<String> = None;
     while let Some(pair) = parts.next() {
       match pair.as_rule() {
-        Rule::ident => {
-          enum_name = Some(quiet_voice(
-            pair.as_str().split("_").next().expect("No underscores"),
-          ))
-        }
+        Rule::ident => enum_name = Some(quiet_voice(pair.into())),
         Rule::comment => comment = Some(format!(" {}", pair.as_str())),
         _ => unreachable!(),
       }
@@ -244,7 +287,7 @@ impl<'a> From<Pair<'a, Rule>> for EnumTy {
     let mut cases: Vec<EnumCaseTy> = vec![];
     while let Some(pair) = parts.next() {
       match pair.as_rule() {
-        Rule::ident => ident = Some(pair.as_str().into()),
+        Rule::ident => ident = Some(AVDLIdent::from(pair).0),
         Rule::enum_case => {
           let mut case: EnumCaseTy = pair.into();
           case.preline_comment = comment.take();
@@ -264,7 +307,7 @@ impl<'a> From<Pair<'a, Rule>> for EnumTy {
 
 impl WriteTo for EnumTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(w, "enum {} {{\n", self.ident)?;
+    write!(w, "pub enum {} {{\n", self.ident)?;
     for case in self.cases.iter() {
       case.write_to(w)?;
     }
@@ -287,8 +330,9 @@ where
 }
 
 // Turns FOO -> Foo
-fn quiet_voice(s: &str) -> String {
-  s.chars()
+fn quiet_voice(s: AVDLIdent) -> String {
+  s.0
+    .chars()
     .enumerate()
     .map(|(i, c)| {
       if i == 0 {
@@ -314,7 +358,7 @@ impl<'a> From<Pair<'a, Rule>> for VariantCaseTy {
     let mut comment: Option<String> = None;
     while let Some(pair) = parts.next() {
       match pair.as_rule() {
-        Rule::ident => enum_name = Some(quiet_voice(pair.as_str())),
+        Rule::ident => enum_name = Some(quiet_voice(pair.into())),
         Rule::ty => enum_inner_ty = Some(pair.into()),
         Rule::comment => comment = Some(format!(" {}", pair.as_str())),
         _ => unreachable!(),
@@ -364,7 +408,7 @@ impl<'a> From<Pair<'a, Rule>> for VariantTy {
 
 impl WriteTo for VariantTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(w, "enum {} {{\n", self.ident)?;
+    write!(w, "pub enum {} {{\n", self.ident)?;
     for case in self.cases.iter() {
       case.write_to(w)?;
     }
@@ -401,7 +445,12 @@ where
     }
   }
 
-  write!(w, "type {} = [u8;{}];", ty.unwrap().to_string(), byte_size)?;
+  write!(
+    w,
+    "pub type {} = [u8;{}];",
+    ty.unwrap().to_string(),
+    byte_size
+  )?;
   Ok(())
 }
 
@@ -436,7 +485,10 @@ impl<'a> From<Pair<'a, Rule>> for AVDLRecordProp {
       match pair.as_rule() {
         Rule::lint | Rule::generic_annotation => attributes.push(pair.as_str().into()),
         Rule::ty => ty = Some(pair.into()),
-        Rule::ident => field = Some(pair.as_str().into()),
+        Rule::ident => {
+          let ident: AVDLIdent = pair.into();
+          field = Some(ident.0);
+        }
         _ => panic!("Unhandled case: {:?}", pair),
       }
     }
@@ -471,7 +523,7 @@ where
 
   write!(
     w,
-    "struct {} {{\n",
+    "pub struct {} {{\n",
     type_name.expect("No Record name").to_string()
   )?;
   for prop in record_props.into_iter() {
@@ -508,13 +560,26 @@ where
         let mut inner = node.into_inner();
         while let Some(n) = inner.next() {
           match n.as_rule() {
-            Rule::protocol_name => write!(w, "// Protocol: {:?}\n", n.as_str())?,
+            Rule::protocol_name => {
+              let protocol_name = n.as_str();
+              write!(w, "// Protocol: {:?}\n", protocol_name)?;
+              write!(w, "#![allow(dead_code)]\n")?;
+              write!(w, "#![allow(non_snake_case)]\n")?;
+              write!(w, "#![allow(non_camel_case_types)]\n")?;
+              write!(w, "#![allow(unused_imports)]\n")?;
+
+              write!(w, "use super::*;\n")?;
+              if protocol_name.to_ascii_lowercase() != "common" {
+                // write!(w, "use super::common::*;\n")?
+                // write!(w, "use super::*;\n")?
+              }
+            }
             Rule::protocol_body => {
               let mut inner = n.into_inner();
               while let Some(protocol_body_node) = inner.next() {
                 let separator = match protocol_body_node.as_rule() {
                   Rule::comment => "",
-                  Rule::generic_annotation => "\n",
+                  Rule::generic_annotation | Rule::import => "\n",
                   _ => "\n\n",
                 };
 
@@ -569,10 +634,19 @@ mod tests {
 
   #[test]
   fn test_type_conversion() {
-    let input = AVDLParser::parse(Rule::ty, "map<TeamInviteID,AnnotatedTeamInvite>");
-    println!("{:?}", input);
-    let ty: AVDLType = input.unwrap().next().unwrap().into();
-    assert_eq!(ty.to_string(), "HashMap<TeamInviteID, AnnotatedTeamInvite>")
+    {
+      let input = AVDLParser::parse(Rule::ty, "map<TeamInviteID,AnnotatedTeamInvite>");
+      let ty: AVDLType = input.unwrap().next().unwrap().into();
+      assert_eq!(
+        ty.to_string(),
+        "std::collections::HashMap<TeamInviteID, AnnotatedTeamInvite>"
+      );
+    }
+    {
+      let input = AVDLParser::parse(Rule::ty, "map<int>");
+      let ty: AVDLType = input.unwrap().next().unwrap().into();
+      assert_eq!(ty.to_string(), "std::collections::HashMap<String, i32>");
+    }
   }
 
   #[test]
@@ -581,7 +655,7 @@ mod tests {
       Rule::import,
       convert_to_import,
       r#"import idl "chat_ui.avdl";"#,
-      "use chat_ui;",
+      "use super::chat_ui::*;",
     )
     .unwrap();
     test_conversion(
@@ -674,7 +748,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       Rule::typedef,
       convert_typedef,
       r#"@typedef("bytes")  record ThreadID {}"#,
-      "type ThreadID = [u8];",
+      "pub type ThreadID = Vec<u8>;",
     )
     .unwrap();
   }
@@ -691,12 +765,12 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   INHERIT_3, // Use the team's policy
   EPHEMERAL_4 // Force all messages to be exploding.
 }"#,
-      "enum RetentionPolicyType {
-  None,
-  Retain, // Keep messages forever
-  Expire, // Delete after a while
-  Inherit, // Use the team's policy
-  Ephemeral, // Force all messages to be exploding.
+      "pub enum RetentionPolicyType {
+  None_0,
+  Retain_1, // Keep messages forever
+  Expire_2, // Delete after a while
+  Inherit_3, // Use the team's policy
+  Ephemeral_4, // Force all messages to be exploding.
 }",
     )
     .unwrap();
@@ -709,10 +783,12 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       convert_record,
       r#"record InboxVersInfo {
   gregor1.UID uid;
+  gregor1.UID type;
   InboxVers vers;
 }"#,
-      r#"struct InboxVersInfo {
+      r#"pub struct InboxVersInfo {
   uid: gregor1::UID,
+  ty: gregor1::UID,
   vers: InboxVers,
 }"#,
     )
@@ -727,7 +803,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
     @mpackkey("c") @jsonkey("c")
     InboxVers vers;
 }"#,
-      r#"struct InboxVersInfo {
+      r#"pub struct InboxVersInfo {
   // @mpackkey("b")
   // @jsonkey("b")
   botUID: Option<gregor1::UID>,
@@ -746,7 +822,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   @optional(true)
   array<string> supersedes;
 }"#,
-      "struct ConvSummary {
+      "pub struct ConvSummary {
   // @jsonkey(\"supersedes\")
   // @optional(true)
   supersedes: Vec<String>,
@@ -761,7 +837,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       Rule::fixed_ty,
       convert_fixed,
       r#"fixed Bytes32(32);"#,
-      "type Bytes32 = [u8;32];",
+      "pub type Bytes32 = [u8;32];",
     )
     .unwrap();
   }
@@ -776,7 +852,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   case VIDEO: AssetMetadataVideo;
   case AUDIO: AssetMetadataAudio;
 }"#,
-      "enum AssetMetadata {
+      "pub enum AssetMetadata {
   Image(AssetMetadataImage),
   Video(AssetMetadataVideo),
   Audio(AssetMetadataAudio),
@@ -790,7 +866,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
     case IMAGE: AssetMetadataImage;
     default: void; // Note, if badged, we should urge an upgrade here.
 }"#,
-      "enum AssetMetadata {
+      "pub enum AssetMetadata {
   Image(AssetMetadataImage),
   Default(()),
 }",
