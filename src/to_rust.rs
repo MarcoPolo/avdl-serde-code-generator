@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 use crate::Rule;
 use pest::iterators::{Pair, Pairs};
+use regex::Regex;
 use std::{
   error::Error,
   fmt::Write as FmtWrite,
   io::{self, Write},
   str::FromStr,
 };
+
+const DERIVES: &'static str = "Eq, PartialEq, Debug";
+const DERIVES_AND_HASH: &'static str = "Eq, PartialEq, Debug, Hash";
 
 fn convert_path_str_to_rust_mod(path: &str, as_name: &str) -> String {
   let path = String::from(path);
@@ -307,7 +311,11 @@ impl<'a> From<Pair<'a, Rule>> for EnumTy {
 
 impl WriteTo for EnumTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(w, "pub enum {} {{\n", self.ident)?;
+    write!(
+      w,
+      "#[derive({})]\npub enum {} {{\n",
+      DERIVES_AND_HASH, self.ident
+    )?;
     for case in self.cases.iter() {
       case.write_to(w)?;
     }
@@ -408,7 +416,11 @@ impl<'a> From<Pair<'a, Rule>> for VariantTy {
 
 impl WriteTo for VariantTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(w, "pub enum {} {{\n", self.ident)?;
+    write!(
+      w,
+      "#[derive({})]\npub enum {} {{\n",
+      DERIVES_AND_HASH, self.ident
+    )?;
     for case in self.cases.iter() {
       case.write_to(w)?;
     }
@@ -447,11 +459,26 @@ where
 
   write!(
     w,
-    "pub type {} = [u8;{}];",
+    // This is the correct one, but doesn't serialize/deserialize easily
+    // "pub type {} = [u8;{}];",
+    "pub type {} = Vec<u8>;",
     ty.unwrap().to_string(),
-    byte_size
+    // byte_size
   )?;
   Ok(())
+}
+
+struct JSONKey {
+  rename_to: String,
+}
+impl<'a> From<&str> for JSONKey {
+  fn from(s: &str) -> Self {
+    let re = Regex::new(r#"@jsonkey\("([^"]+)"\)"#).unwrap();
+    let mut captures = re.captures_iter(s);
+    JSONKey {
+      rename_to: captures.next().expect("Regex didn't match")[1].into(),
+    }
+  }
 }
 
 struct AVDLRecordProp {
@@ -460,15 +487,34 @@ struct AVDLRecordProp {
   attributes: Vec<String>,
 }
 
+impl AVDLRecordProp {
+  fn can_hash(&self) -> bool {
+    match self.ty.to_string().as_str() {
+      "f64" => false,
+      _ => true,
+    }
+  }
+}
+
 pub trait WriteTo {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error>;
 }
 
 impl WriteTo for AVDLRecordProp {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
+    let mut json_key: Option<JSONKey> = None;
     for attr in self.attributes.iter() {
-      write!(w, "  // {}\n", attr)?;
+      if attr.contains("@jsonkey") {
+        json_key = Some(attr.as_str().into())
+      } else {
+        write!(w, "  // {}\n", attr)?;
+      }
     }
+
+    if let Some(json_key) = json_key {
+      write!(w, "  // #[serde(rename = \"{}\")]\n", json_key.rename_to)?;
+    }
+
     write!(w, "  {}: {},\n", self.field, self.ty.to_string())?;
     Ok(())
   }
@@ -520,10 +566,16 @@ where
       _ => panic!("Unhandled case: {:?}", pair),
     }
   }
+  let all_can_hash = record_props.iter().all(|p| p.can_hash());
 
   write!(
     w,
-    "pub struct {} {{\n",
+    "#[derive({})]\npub struct {} {{\n",
+    if all_can_hash {
+      DERIVES_AND_HASH
+    } else {
+      DERIVES
+    },
     type_name.expect("No Record name").to_string()
   )?;
   for prop in record_props.into_iter() {
@@ -568,6 +620,7 @@ where
               write!(w, "#![allow(non_camel_case_types)]\n")?;
               write!(w, "#![allow(unused_imports)]\n")?;
 
+              write!(w, "use serde::{{Serialize, Deserialize}};\n")?;
               write!(w, "use super::*;\n")?;
               if protocol_name.to_ascii_lowercase() != "common" {
                 // write!(w, "use super::common::*;\n")?
@@ -765,13 +818,16 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   INHERIT_3, // Use the team's policy
   EPHEMERAL_4 // Force all messages to be exploding.
 }"#,
-      "pub enum RetentionPolicyType {
+      &format!(
+        "#[derive({})]\npub enum RetentionPolicyType {{
   None_0,
   Retain_1, // Keep messages forever
   Expire_2, // Delete after a while
   Inherit_3, // Use the team's policy
   Ephemeral_4, // Force all messages to be exploding.
-}",
+}}",
+        DERIVES
+      ),
     )
     .unwrap();
   }
@@ -786,11 +842,15 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   gregor1.UID type;
   InboxVers vers;
 }"#,
-      r#"pub struct InboxVersInfo {
+      &format!(
+        r#"#[derive({})]
+pub struct InboxVersInfo {{
   uid: gregor1::UID,
   ty: gregor1::UID,
   vers: InboxVers,
-}"#,
+}}"#,
+        format!("{}, Hash", DERIVES)
+      ),
     )
     .unwrap();
 
@@ -803,14 +863,18 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
     @mpackkey("c") @jsonkey("c")
     InboxVers vers;
 }"#,
-      r#"pub struct InboxVersInfo {
+      &format!(
+        r#"#[derive({})]
+pub struct InboxVersInfo {{
   // @mpackkey("b")
-  // @jsonkey("b")
+  // #[serde(rename = "b")]
   botUID: Option<gregor1::UID>,
   // @mpackkey("c")
-  // @jsonkey("c")
+  // #[serde(rename = "c")]
   vers: InboxVers,
-}"#,
+}}"#,
+        format!("{}, Hash", DERIVES)
+      ),
     )
     .unwrap();
 
@@ -818,15 +882,35 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       Rule::record,
       convert_record,
       r#"record ConvSummary {
-  @jsonkey("supersedes")
   @optional(true)
   array<string> supersedes;
 }"#,
-      "pub struct ConvSummary {
-  // @jsonkey(\"supersedes\")
+      &format!(
+        "#[derive({})]
+pub struct ConvSummary {{
   // @optional(true)
   supersedes: Vec<String>,
-}",
+}}",
+        format!("{}, Hash", DERIVES)
+      ),
+    )
+    .unwrap();
+
+    test_conversion(
+      Rule::record,
+      convert_record,
+      r#"record ConvSummary {
+  @optional(true)
+  array<f32> supersedes;
+}"#,
+      &format!(
+        "#[derive({})]
+pub struct ConvSummary {{
+  // @optional(true)
+  supersedes: Vec<f32>,
+}}",
+        format!("{}", DERIVES)
+      ),
     )
     .unwrap();
   }
@@ -837,7 +921,8 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       Rule::fixed_ty,
       convert_fixed,
       r#"fixed Bytes32(32);"#,
-      "pub type Bytes32 = [u8;32];",
+      // "pub type Bytes32 = [u8;32];",
+      "pub type Bytes32 = Vec<u8>;",
     )
     .unwrap();
   }
@@ -852,11 +937,14 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   case VIDEO: AssetMetadataVideo;
   case AUDIO: AssetMetadataAudio;
 }"#,
-      "pub enum AssetMetadata {
+      &format!(
+        "#[derive({})]\npub enum AssetMetadata {{
   Image(AssetMetadataImage),
   Video(AssetMetadataVideo),
   Audio(AssetMetadataAudio),
-}",
+}}",
+        DERIVES
+      ),
     )
     .unwrap();
     test_conversion(
@@ -866,10 +954,13 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
     case IMAGE: AssetMetadataImage;
     default: void; // Note, if badged, we should urge an upgrade here.
 }"#,
-      "pub enum AssetMetadata {
+      &format!(
+        "#[derive({})]\npub enum AssetMetadata {{
   Image(AssetMetadataImage),
   Default(()),
-}",
+}}",
+        DERIVES
+      ),
     )
     .unwrap();
   }
