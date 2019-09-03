@@ -3,14 +3,37 @@ use crate::Rule;
 use pest::iterators::{Pair, Pairs};
 use regex::Regex;
 use std::{
+  cell::RefCell,
   error::Error,
   fmt::Write as FmtWrite,
   io::{self, Write},
   str::FromStr,
 };
 
-const DERIVES: &'static str = "Eq, PartialEq, Debug";
-const DERIVES_AND_HASH: &'static str = "Eq, PartialEq, Debug, Hash";
+const DERIVES: &'static str = "Serialize, Deserialize, Debug";
+const DERIVES_WITH_HASH: &'static str = "Serialize, Deserialize, Debug, Hash, PartialEq, Eq";
+
+thread_local! {
+    pub static ADD_DERIVE: RefCell<bool> = RefCell::new(false);
+    pub static DERIVE_HASH_FOR_IDENT: RefCell<Vec<String>> = RefCell::new(vec![]);
+
+}
+
+pub fn set_derive_hash_for_ident(v: Vec<String>) {
+  DERIVE_HASH_FOR_IDENT.with(|t| {
+    *t.borrow_mut() = v;
+  });
+}
+
+fn should_derive_hash(v: &str) -> bool {
+  DERIVE_HASH_FOR_IDENT.with(|t| t.borrow().iter().any(|s| s.as_str() == v))
+}
+
+pub fn set_add_derive(v: bool) {
+  ADD_DERIVE.with(|add_derive| {
+    *add_derive.borrow_mut() = v;
+  })
+}
 
 fn convert_path_str_to_rust_mod(path: &str, as_name: &str) -> String {
   let path = String::from(path);
@@ -72,7 +95,8 @@ fn convert_idl_type_to_rust_type(idl_type: &str) -> String {
     return format!("Box<{}>", idl_type);
   }
   match idl_type {
-    "bytes" => String::from("Vec<u8>"),
+    // "bytes" => String::from("Vec<u8>"),
+    "bytes" => String::from("String"),
     "boolean" => String::from("bool"),
     "uint" => String::from("u32"),
     "int" => String::from("i32"),
@@ -83,6 +107,7 @@ fn convert_idl_type_to_rust_type(idl_type: &str) -> String {
     "uint32" => String::from("u32"),
     "array" => String::from("Vec"),
     "string" => String::from("String"),
+    "Hash" => String::from("String"),
     "void" => String::from("()"),
     "map" => String::from("std::collections::HashMap"),
     _ => idl_type.into(),
@@ -314,7 +339,7 @@ impl WriteTo for EnumTy {
     write!(
       w,
       "#[derive({})]\npub enum {} {{\n",
-      DERIVES_AND_HASH, self.ident
+      DERIVES_WITH_HASH, self.ident
     )?;
     for case in self.cases.iter() {
       case.write_to(w)?;
@@ -416,11 +441,8 @@ impl<'a> From<Pair<'a, Rule>> for VariantTy {
 
 impl WriteTo for VariantTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(
-      w,
-      "#[derive({})]\npub enum {} {{\n",
-      DERIVES_AND_HASH, self.ident
-    )?;
+    write_derives(w, false).unwrap();
+    write!(w, "pub enum {} {{\n", self.ident)?;
     for case in self.cases.iter() {
       case.write_to(w)?;
     }
@@ -446,12 +468,12 @@ where
   assert_eq!(p.as_rule(), Rule::fixed_ty);
   let mut parts = p.into_inner();
   let mut ty: Option<AVDLType> = None;
-  let mut byte_size: usize = 0;
+  let mut _byte_size: usize = 0;
   while let Some(pair) = parts.next() {
     match pair.as_rule() {
       Rule::ty => ty = Some(pair.into()),
       Rule::byte_size => {
-        byte_size = usize::from_str(pair.as_str()).expect("Couldn't parse byte_size")
+        _byte_size = usize::from_str(pair.as_str()).expect("Couldn't parse byte_size")
       }
       _ => unreachable!(),
     }
@@ -503,19 +525,62 @@ pub trait WriteTo {
 impl WriteTo for AVDLRecordProp {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
     let mut json_key: Option<JSONKey> = None;
+    let add_derive = ADD_DERIVE.with(|add_derive| *add_derive.borrow());
+    let mut is_optional = add_derive;
+    let mut add_default = false;
+    let mut is_bytes = false;
     for attr in self.attributes.iter() {
       if attr.contains("@jsonkey") {
         json_key = Some(attr.as_str().into())
+      } else if attr.contains("@optional(true)") {
+        is_optional = true;
       } else {
         write!(w, "  // {}\n", attr)?;
       }
     }
 
     if let Some(json_key) = json_key {
-      write!(w, "  // #[serde(rename = \"{}\")]\n", json_key.rename_to)?;
+      if add_derive {
+        write!(w, "  #[serde(rename = \"{}\")]\n", json_key.rename_to).unwrap();
+      }
     }
 
-    write!(w, "  {}: {},\n", self.field, self.ty.to_string())?;
+    let ty_str = self.ty.to_string();
+    if ty_str == "String" || ty_str.contains("Vec") {
+      add_default = true;
+      is_optional = true;
+    }
+
+    if ty_str.contains("Vec<u8>") {
+      is_bytes = true;
+    }
+
+    if ty_str == "bool" {
+      add_default = true;
+    }
+
+    if ty_str.contains("Option<") {
+      is_optional = false;
+    }
+
+    if add_default && add_derive {
+      write!(w, "  #[serde(default)]\n").unwrap();
+    }
+
+    if is_bytes && add_derive {
+      // write!(w, r#"  #[serde(with = "Base64Standard")]\n"#).unwrap();
+    }
+
+    if is_optional {
+      write!(
+        w,
+        "  pub {}: Option<{}>,\n",
+        self.field,
+        self.ty.to_string()
+      )?;
+    } else {
+      write!(w, "  pub {}: {},\n", self.field, self.ty.to_string())?;
+    }
     Ok(())
   }
 }
@@ -547,6 +612,24 @@ impl<'a> From<Pair<'a, Rule>> for AVDLRecordProp {
   }
 }
 
+fn write_derives<W>(w: &mut W, can_hash: bool) -> Result<(), Box<dyn Error>>
+where
+  W: Write,
+{
+  ADD_DERIVE.with(|add_derive| {
+    if *add_derive.borrow() {
+      write!(
+        w,
+        "#[derive({})]\n",
+        if can_hash { DERIVES_WITH_HASH } else { DERIVES }
+      )
+      .unwrap();
+    }
+  });
+
+  Ok(())
+}
+
 fn convert_record<W>(w: &mut W, p: Pair<Rule>) -> Result<(), Box<dyn Error>>
 where
   W: Write,
@@ -566,18 +649,14 @@ where
       _ => panic!("Unhandled case: {:?}", pair),
     }
   }
-  let all_can_hash = record_props.iter().all(|p| p.can_hash());
 
-  write!(
-    w,
-    "#[derive({})]\npub struct {} {{\n",
-    if all_can_hash {
-      DERIVES_AND_HASH
-    } else {
-      DERIVES
-    },
-    type_name.expect("No Record name").to_string()
-  )?;
+  // let can_hash = false;
+  let ident = type_name.expect("No Record name").to_string();
+  let can_hash = should_derive_hash(&ident);
+  println!("Can Hash {} {}", ident, can_hash);
+
+  write_derives(w, can_hash)?;
+  write!(w, "pub struct {} {{\n", ident)?;
   for prop in record_props.into_iter() {
     prop.write_to(w)?;
   }
@@ -826,7 +905,7 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   Inherit_3, // Use the team's policy
   Ephemeral_4, // Force all messages to be exploding.
 }}",
-        DERIVES
+        DERIVES_WITH_HASH
       ),
     )
     .unwrap();
@@ -834,22 +913,24 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
 
   #[test]
   fn test_record() {
+    set_add_derive(true);
     test_conversion(
       Rule::record,
       convert_record,
       r#"record InboxVersInfo {
   gregor1.UID uid;
   gregor1.UID type;
+  @optional(true)
   InboxVers vers;
 }"#,
       &format!(
         r#"#[derive({})]
 pub struct InboxVersInfo {{
-  uid: gregor1::UID,
-  ty: gregor1::UID,
-  vers: InboxVers,
+  pub uid: gregor1::UID,
+  pub ty: gregor1::UID,
+  pub vers: Option<InboxVers>,
 }}"#,
-        format!("{}, Hash", DERIVES)
+        format!("{}", DERIVES)
       ),
     )
     .unwrap();
@@ -867,17 +948,18 @@ pub struct InboxVersInfo {{
         r#"#[derive({})]
 pub struct InboxVersInfo {{
   // @mpackkey("b")
-  // #[serde(rename = "b")]
-  botUID: Option<gregor1::UID>,
+  #[serde(rename = "b")]
+  pub botUID: Option<gregor1::UID>,
   // @mpackkey("c")
-  // #[serde(rename = "c")]
-  vers: InboxVers,
+  #[serde(rename = "c")]
+  pub vers: InboxVers,
 }}"#,
-        format!("{}, Hash", DERIVES)
+        format!("{}", DERIVES)
       ),
     )
     .unwrap();
 
+    set_derive_hash_for_ident(vec![String::from("ConvSummary")]);
     test_conversion(
       Rule::record,
       convert_record,
@@ -888,10 +970,26 @@ pub struct InboxVersInfo {{
       &format!(
         "#[derive({})]
 pub struct ConvSummary {{
-  // @optional(true)
-  supersedes: Vec<String>,
+  pub supersedes: Option<Vec<String>>,
 }}",
-        format!("{}, Hash", DERIVES)
+        format!("{}, Hash, PartialEq, Eq", DERIVES)
+      ),
+    )
+    .unwrap();
+    set_derive_hash_for_ident(vec![]);
+
+    test_conversion(
+      Rule::record,
+      convert_record,
+      r#"record ConvSummary {
+  array<string> supersedes;
+}"#,
+      &format!(
+        "#[derive({})]
+pub struct ConvSummary {{
+  pub supersedes: Vec<String>,
+}}",
+        format!("{}", DERIVES)
       ),
     )
     .unwrap();
@@ -906,8 +1004,7 @@ pub struct ConvSummary {{
       &format!(
         "#[derive({})]
 pub struct ConvSummary {{
-  // @optional(true)
-  supersedes: Vec<f32>,
+  pub supersedes: Option<Vec<f32>>,
 }}",
         format!("{}", DERIVES)
       ),
@@ -929,6 +1026,7 @@ pub struct ConvSummary {{
 
   #[test]
   fn test_variant() {
+    set_add_derive(true);
     test_conversion(
       Rule::variant_ty,
       convert_variant,
