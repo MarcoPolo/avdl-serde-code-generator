@@ -3,7 +3,7 @@ name = "avdl-serde-code-generator"
 version = "0.1.0"
 authors = ["Marco Munizaga <marco@marcopolo.io>"]
 edition = "2018"
-description = "A library to convert avdl decalarations into Rust types with serde support"
+description = "A library to convert avdl declarations into Rust types with serde support"
 repository = "https://github.com/MarcoPolo/avdl-serde-code-generator"
 license = "Apache-2.0 OR MIT"
 
