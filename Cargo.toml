@@ -1,5 +1,5 @@
 [package]
-name = "avdl-parser"
+name = "avdl-serde-code-generator"
 version = "0.1.0"
 authors = ["Marco Munizaga <marco@marcopolo.io>"]
 edition = "2018"

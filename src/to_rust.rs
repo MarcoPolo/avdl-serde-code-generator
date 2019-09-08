@@ -901,7 +901,9 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       Rule::typedef,
       convert_typedef,
       r#"@typedef("bytes")  record ThreadID {}"#,
-      "pub type ThreadID = Vec<u8>;",
+      // TODO fix this when we support bytes
+      // "pub type ThreadID = Vec<u8>;",
+      "pub type ThreadID = String;",
     )
     .unwrap();
   }
@@ -919,14 +921,14 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
   EPHEMERAL_4 // Force all messages to be exploding.
 }"#,
       &format!(
-        "#[derive({})]\npub enum RetentionPolicyType {{
+        "#[derive({})]\n#[repr(u8)]\npub enum RetentionPolicyType {{
   None_0,
   Retain_1, // Keep messages forever
   Expire_2, // Delete after a while
   Inherit_3, // Use the team's policy
   Ephemeral_4, // Force all messages to be exploding.
 }}",
-        DERIVES_WITH_HASH
+        DERIVES_WITH_HASH_ENUM
       ),
     )
     .unwrap();
@@ -947,8 +949,9 @@ MessageID readMsgID, keybase1.TLFIdentifyBehavior identifyBehavior);"#,
       &format!(
         r#"#[derive({})]
 pub struct InboxVersInfo {{
-  pub uid: gregor1::UID,
-  pub ty: gregor1::UID,
+  pub uid: Option<gregor1::UID>,
+  #[serde(rename = "type")]
+  pub ty: Option<gregor1::UID>,
   pub vers: Option<InboxVers>,
 }}"#,
         format!("{}", DERIVES)
@@ -973,7 +976,7 @@ pub struct InboxVersInfo {{
   pub botUID: Option<gregor1::UID>,
   // @mpackkey("c")
   #[serde(rename = "c")]
-  pub vers: InboxVers,
+  pub vers: Option<InboxVers>,
 }}"#,
         format!("{}", DERIVES)
       ),
@@ -991,6 +994,7 @@ pub struct InboxVersInfo {{
       &format!(
         "#[derive({})]
 pub struct ConvSummary {{
+  #[serde(default)]
   pub supersedes: Option<Vec<String>>,
 }}",
         format!("{}, Hash, PartialEq, Eq", DERIVES)
@@ -1008,7 +1012,8 @@ pub struct ConvSummary {{
       &format!(
         "#[derive({})]
 pub struct ConvSummary {{
-  pub supersedes: Vec<String>,
+  #[serde(default)]
+  pub supersedes: Option<Vec<String>>,
 }}",
         format!("{}", DERIVES)
       ),
@@ -1025,6 +1030,7 @@ pub struct ConvSummary {{
       &format!(
         "#[derive({})]
 pub struct ConvSummary {{
+  #[serde(default)]
   pub supersedes: Option<Vec<f32>>,
 }}",
         format!("{}", DERIVES)
@@ -1057,7 +1063,7 @@ pub struct ConvSummary {{
   case AUDIO: AssetMetadataAudio;
 }"#,
       &format!(
-        "#[derive({})]\npub enum AssetMetadata {{
+        "#[derive({})]\n#[serde(untagged)]\npub enum AssetMetadata {{
   Image(AssetMetadataImage),
   Video(AssetMetadataVideo),
   Audio(AssetMetadataAudio),
@@ -1074,7 +1080,7 @@ pub struct ConvSummary {{
     default: void; // Note, if badged, we should urge an upgrade here.
 }"#,
       &format!(
-        "#[derive({})]\npub enum AssetMetadata {{
+        "#[derive({})]\n#[serde(untagged)]\npub enum AssetMetadata {{
   Image(AssetMetadataImage),
   Default(()),
 }}",
