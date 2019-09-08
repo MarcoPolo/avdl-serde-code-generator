@@ -12,6 +12,8 @@ use std::{
 
 const DERIVES: &'static str = "Serialize, Deserialize, Debug";
 const DERIVES_WITH_HASH: &'static str = "Serialize, Deserialize, Debug, Hash, PartialEq, Eq";
+const DERIVES_WITH_HASH_ENUM: &'static str =
+  "Serialize_repr, Deserialize_repr, Debug, Hash, PartialEq, Eq";
 
 thread_local! {
     pub static ADD_DERIVE: RefCell<bool> = RefCell::new(false);
@@ -338,8 +340,8 @@ impl WriteTo for EnumTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
     write!(
       w,
-      "#[derive({})]\npub enum {} {{\n",
-      DERIVES_WITH_HASH, self.ident
+      "#[derive({})]\n#[repr(u8)]\npub enum {} {{\n",
+      DERIVES_WITH_HASH_ENUM, self.ident
     )?;
     for case in self.cases.iter() {
       case.write_to(w)?;
@@ -441,7 +443,10 @@ impl<'a> From<Pair<'a, Rule>> for VariantTy {
 
 impl WriteTo for VariantTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write_derives(w, false).unwrap();
+    let added_derives = write_derives(w, false).unwrap();
+    if added_derives {
+      write!(w, "#[serde(untagged)]\n")?;
+    }
     write!(w, "pub enum {} {{\n", self.ident)?;
     for case in self.cases.iter() {
       case.write_to(w)?;
@@ -539,6 +544,18 @@ impl WriteTo for AVDLRecordProp {
       }
     }
 
+    if json_key.is_none() && add_derive {
+      match self.field.as_str() {
+        "ty" => write!(w, "  #[serde(rename = \"type\")]\n").unwrap(),
+        "box_" => write!(w, "  #[serde(rename = \"box\")]\n").unwrap(),
+        "match_" => write!(w, "  #[serde(rename = \"match\")]\n").unwrap(),
+        "ref_" => write!(w, "  #[serde(rename = \"ref\")]\n").unwrap(),
+        "self_" => write!(w, "  #[serde(rename = \"self\")]\n").unwrap(),
+        "where_" => write!(w, "  #[serde(rename = \"where\")]\n").unwrap(),
+        _ => {}
+      }
+    }
+
     if let Some(json_key) = json_key {
       if add_derive {
         write!(w, "  #[serde(rename = \"{}\")]\n", json_key.rename_to).unwrap();
@@ -612,11 +629,11 @@ impl<'a> From<Pair<'a, Rule>> for AVDLRecordProp {
   }
 }
 
-fn write_derives<W>(w: &mut W, can_hash: bool) -> Result<(), Box<dyn Error>>
+fn write_derives<W>(w: &mut W, can_hash: bool) -> Result<bool, Box<dyn Error>>
 where
   W: Write,
 {
-  ADD_DERIVE.with(|add_derive| {
+  let did_add = ADD_DERIVE.with(|add_derive| {
     if *add_derive.borrow() {
       write!(
         w,
@@ -624,10 +641,13 @@ where
         if can_hash { DERIVES_WITH_HASH } else { DERIVES }
       )
       .unwrap();
+      true
+    } else {
+      false
     }
   });
 
-  Ok(())
+  Ok(did_add)
 }
 
 fn convert_record<W>(w: &mut W, p: Pair<Rule>) -> Result<(), Box<dyn Error>>
@@ -700,6 +720,7 @@ where
               write!(w, "#![allow(unused_imports)]\n")?;
 
               write!(w, "use serde::{{Serialize, Deserialize}};\n")?;
+              write!(w, "use serde_repr::{{Deserialize_repr, Serialize_repr}};")?;
               write!(w, "use super::*;\n")?;
               if protocol_name.to_ascii_lowercase() != "common" {
                 // write!(w, "use super::common::*;\n")?
