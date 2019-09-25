@@ -410,7 +410,19 @@ impl<'a> From<Pair<'a, Rule>> for VariantCaseTy {
 
 impl WriteTo for VariantCaseTy {
   fn write_to<W: Write>(&self, w: &mut W) -> Result<(), io::Error> {
-    write!(w, "  {}({}),\n", self.enum_name, self.enum_inner_ty)?;
+    if self.enum_name == "Default" {
+      writeln!(w, "  {} {{}},", self.enum_name)?;
+    } else {
+      let enum_lowercase = match self.enum_name.as_str() {
+        "Move" => String::from("r#move"),
+        s => s.to_ascii_lowercase(),
+      };
+      writeln!(
+        w,
+        "  {} {{{}: {}}},",
+        self.enum_name, enum_lowercase, self.enum_inner_ty
+      )?;
+    }
     Ok(())
   }
 }
@@ -1064,9 +1076,9 @@ pub struct ConvSummary {{
 }"#,
       &format!(
         "#[derive({})]\n#[serde(untagged)]\npub enum AssetMetadata {{
-  Image(AssetMetadataImage),
-  Video(AssetMetadataVideo),
-  Audio(AssetMetadataAudio),
+  Image {{image: AssetMetadataImage}},
+  Video {{video: AssetMetadataVideo}},
+  Audio {{audio: AssetMetadataAudio}},
 }}",
         DERIVES
       ),
@@ -1077,12 +1089,14 @@ pub struct ConvSummary {{
       convert_variant,
       r#"variant AssetMetadata switch (AssetMetadataType assetType) {
     case IMAGE: AssetMetadataImage;
+    case MOVE: Thing;
     default: void; // Note, if badged, we should urge an upgrade here.
 }"#,
       &format!(
         "#[derive({})]\n#[serde(untagged)]\npub enum AssetMetadata {{
-  Image(AssetMetadataImage),
-  Default(()),
+  Image {{image: AssetMetadataImage}},
+  Move {{r#move: Thing}},
+  Default {{}},
 }}",
         DERIVES
       ),
