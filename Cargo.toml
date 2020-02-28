@@ -1,6 +1,6 @@
 [package]
 name = "avdl-serde-code-generator"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Marco Munizaga <marco@marcopolo.io>"]
 edition = "2018"
 description = "A library to convert avdl declarations into Rust types with serde support"
