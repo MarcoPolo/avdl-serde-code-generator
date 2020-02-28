@@ -33,7 +33,7 @@ record = { "record " ~ ty ~ "{" ~ (record_prop | comment)* ~ "}"}
 record_prop = { (lint | generic_annotation)* ~ ty ~ ident ~ ";" }
 
 namespace_annotation = ${ "@namespace" ~ "(\"" ~ namespace_name ~ "\")" }
-generic_annotation = { "@" ~ ident ~ "(" ~ ("true" | "false" | "\"" ~ lax_ident? ~ "\"") ~ ")" }
+generic_annotation = { "@" ~ ident ~ "(" ~ ("true" | "false" | digit+ | "\"" ~ lax_ident? ~ ("," ~ lax_ident)* ~ "\"") ~ ")" }
 lint = { "@lint(\"" ~ ident ~ "\")" }
 typedef = { "@typedef(\"" ~ ty ~ "\")" ~ lint? ~ record }
 

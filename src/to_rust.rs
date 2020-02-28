@@ -44,11 +44,23 @@ fn convert_path_str_to_rust_mod(path: &str, as_name: &str) -> String {
   let is_as_name_same = as_name == "" || parts.last().unwrap() == &as_name;
 
   let mut module = if has_parts {
-    let important_parts = parts
-      .into_iter()
-      .skip_while(|s| s != &"protocol")
-      .collect::<Vec<&str>>();
-    format!("crate::{}", important_parts.join("::"))
+    if parts.get(0) == Some(&"..") {
+      let mut s = String::from("super::");
+      s.push_str(
+        &parts
+          .into_iter()
+          .map(|part| if part == ".." { "super" } else { part })
+          .collect::<Vec<&str>>()
+          .join("::"),
+      );
+      s
+    } else {
+      let important_parts = parts
+        .into_iter()
+        .skip_while(|s| s != &"protocol")
+        .collect::<Vec<&str>>();
+      format!("crate::{}", important_parts.join("::"))
+    }
   } else {
     format!("super::{}::*", path.replace(".avdl", ""))
   };
@@ -1104,4 +1116,11 @@ pub struct ConvSummary {{
     .unwrap();
   }
 
+  #[test]
+  fn test_import_bug() {
+    assert_eq!(
+      "super::super::keybase1;",
+      convert_path_str_to_rust_mod("../keybase1", "keybase1")
+    );
+  }
 }
